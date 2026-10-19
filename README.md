@@ -1,82 +1,297 @@
-# Ingestão e Busca Semântica com LangChain e Postgres
+# Perguntas sobre um PDF, com LangChain e Postgres
 
-## Objetivo
+Este repositório lê um PDF, guarda os trechos como vetores no PostgreSQL e responde perguntas no terminal. A resposta sai somente dos trechos recuperados. Se a informação não estiver nesses trechos, a frase é sempre:
 
-Você deve entregar um software capaz de:
+`Não tenho informações necessárias para responder sua pergunta.`
 
-- Ingestão: Ler um arquivo PDF e salvar suas informações em um banco de dados PostgreSQL com extensão pgVector.
-- Busca: Permitir que o usuário faça perguntas via linha de comando (CLI) e receba respostas baseadas apenas no conteúdo do PDF.
+## Caminho dos dados
 
-## Exemplo no CLI
+```
+document.pdf
+    │  PyPDFLoader
+    ▼
+34 páginas
+    │  cortes de 1000 caracteres, 150 de sobreposição
+    ▼
+67 trechos
+    │  text-embedding-3-small
+    ▼
+Postgres + pgvector  (collection mba_docs)
 
-Faça sua pergunta:
+pergunta no terminal
+    │  o mesmo modelo de embedding
+    ▼
+10 trechos mais próximos
+    │  prompt fixo + gpt-5-nano
+    ▼
+resposta
+```
+
+A LLM não recebe o PDF inteiro. Ela recebe os 10 trechos mais próximos da pergunta e as regras que impedem o uso de conhecimento de fora do documento.
+
+## Antes de começar
+
+- Python 3.13
+- Docker com o plugin Compose
+- Chave da OpenAI com saldo em [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+
+O projeto usa só a OpenAI. O embedding é `text-embedding-3-small`. O chat é `gpt-5-nano`.
+
+## Preparação
+
+Crie o ambiente e instale as dependências fixadas:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Copie o modelo de ambiente e preencha a chave:
+
+```bash
+cp .env.example .env
+```
+
+| Variável | Função |
+|---|---|
+| `OPENAI_API_KEY` | Chave da API. É o único valor que você precisa colocar. |
+| `OPENAI_EMBEDDING_MODEL` | Modelo que gera os vetores. Aqui, `text-embedding-3-small`. |
+| `OPENAI_MODEL` | Modelo que redige a resposta. Aqui, `gpt-5-nano`. |
+| `DATABASE_URL` | Conexão `postgresql+psycopg://postgres:postgres@localhost:5432/rag`. |
+| `PG_VECTOR_COLLECTION_NAME` | Nome da collection. Aqui, `mba_docs`. |
+| `PDF_PATH` | Caminho do PDF a partir da raiz do projeto. |
+
+O `.env` está no `.gitignore`. Ele fica só na sua máquina.
+
+Suba o banco:
+
+```bash
+docker compose up -d
+```
+
+O Compose sobe o PostgreSQL 17 com a imagem `pgvector/pgvector` e cria a extensão `vector`. O container `postgres_rag` precisa aparecer saudável:
+
+```bash
+docker compose ps
+```
+
+## Uso
+
+Ingestão, uma vez por PDF ou depois de trocar o arquivo:
+
+```bash
+python src/ingest.py
+```
+
+Saída esperada:
+
+```
+PDF lido: 34 páginas em document.pdf
+Recorte: 67 trechos de 1000 caracteres, com 150 de sobreposição
+Gravação concluída: 67 trechos na collection mba_docs
+```
+
+Chat:
+
+```bash
+python src/chat.py
+```
+
+## Sessão de exemplo
+
+```
+Perguntas sobre o PDF. A resposta usa só o que foi recuperado do banco.
+Encerre com sair, ou com Ctrl+C.
+
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: R$ 10.000.000,00
+
+PERGUNTA: Qual o faturamento da Alfa Telecom LTDA?
+RESPOSTA: R$ 80.272.365,43
+
+PERGUNTA: Em que ano foi fundada a Alfa Energia S.A.?
+RESPOSTA: 1972
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+
+PERGUNTA: sair
+Encerrado.
+```
+
+## Arquivos
+
+```
+├── docker-compose.yml    # Postgres 17 e a extensão vector
+├── requirements.txt      # pacotes com versão travada
+├── .env.example          # variáveis sem segredo
+├── document.pdf          # documento ingerido
+├── src/
+│   ├── ingest.py         # PDF, recorte, embeddings e gravação
+│   ├── search.py         # busca dos 10 trechos, prompt e LLM
+│   └── chat.py           # loop do terminal
+└── README.md
+```
+
+## Escolhas deste repositório
+
+O enunciado pede cortes de 1000 caracteres, com 150 de sobreposição, e uma busca dos 10 trechos mais próximos. Eu segui isso. A sobreposição existe porque o corte não olha o sentido da frase: se uma informação fica bem na divisa de dois pedaços, um pouco dela se repete no pedaço seguinte e a busca ainda consegue achar. Os 10 trechos chegam juntos para o modelo. Ele lê o que está escrito e monta a resposta a partir daí.
+
+Para abrir o PDF, usei o `PyPDFLoader`, que é o carregador sugerido no desafio. Cada página vira um documento, e o recorte leva essa informação junto.
+
+Toda vez que eu rodo a ingestão, a collection é apagada antes de gravar de novo (`pre_delete_collection=True`). Se eu deixasse os vetores antigos, a segunda execução duplicaria tudo e a busca dos 10 trechos perderia espaço com cópias. A consulta só lê. Ela não mexe no que já está salvo.
+
+No chat eu fiquei com o `gpt-5-nano` e `reasoning_effort="low"`. É o modelo de conversa mais barato que ainda respondeu certo neste PDF. Com o esforço `minimal`, ele dizia que não sabia mesmo quando a resposta estava no documento. Com `low`, as perguntas do exemplo voltaram com o valor certo, e as que estão fora do PDF caíram na frase pedida. O modelo de embedding continua o mesmo, então eu não precisei ingerir o arquivo outra vez.
+
+## Resultados
+
+Fui testando uma configuração de cada vez. O embedding foi sempre `text-embedding-3-small`. O que mudou foi o modelo de chat e o esforço de raciocínio.
+
+**`gpt-6-luna` sem temperatura.** A pergunta do PDF veio certa e a pergunta de fora caiu na frase do enunciado:
 
 ```
 PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
-RESPOSTA: O faturamento foi de 10 milhões de reais.
-
----
-
-Perguntas fora do contexto:
+RESPOSTA: R$ 10.000.000,00
 
 PERGUNTA: Quantos clientes temos em 2024?
 RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
 ```
 
+**`gpt-6-luna` com `temperature=0` e `reasoning_effort="none"`.** Com o raciocínio desligado, a temperatura zero passou. O resultado foi o mesmo das duas perguntas acima.
+
+**`gpt-5-nano` com `reasoning_effort="minimal"`.** A API aceitou, mas o modelo recusou até o que estava escrito no PDF:
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+
+PERGUNTA: Qual é a capital da França?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+**`gpt-4.1-nano` com `temperature=0`.** Esse aceita temperatura direto e respondeu certo. Eu não fiquei com ele porque o `gpt-5-nano` custa menos na entrada e, no ajuste seguinte, também acertou:
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: R$ 10.000.000,00
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+**`gpt-5-nano` com `reasoning_effort="low"`.** Esta é a configuração que ficou no projeto. As perguntas de dentro do PDF voltaram com o número do documento, e a de fora ficou na frase obrigatória:
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: R$ 10.000.000,00
+
+PERGUNTA: Qual o faturamento da Alfa Telecom LTDA?
+RESPOSTA: R$ 80.272.365,43
+
+PERGUNTA: Em que ano foi fundada a Alfa Energia S.A.?
+RESPOSTA: 1972
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+Rodei as mesmas duas perguntas no `gpt-6-luna`, com o raciocínio desligado, em quatro temperaturas: 0, 0,7, 1,3 e 2.
+
+**Temperatura 0.** A resposta do faturamento veio só com o valor, sem frase em volta. A pergunta de clientes em 2024 ficou na frase de quem não achou a informação no PDF.
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: R$ 10.000.000,00
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+**Temperatura 0,7.** O faturamento continuou o mesmo, mas o modelo escreveu uma frase inteira em vez de soltar só o número. A pergunta de fora do PDF não escapou.
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: O faturamento da SuperTechIABrazil é R$ 10.000.000,00.
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+**Temperatura 1,3.** Voltou ao número seco, igual na temperatura 0. A pergunta de 2024 de novo caiu na frase obrigatória.
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: R$ 10.000.000,00
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+**Temperatura 2.** No teto da faixa, a resposta do faturamento ficou na frase completa de novo, com o mesmo valor. A pergunta que não está no documento continuou recusada.
+
+```
+PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
+RESPOSTA: O faturamento da SuperTechIABrazil é R$ 10.000.000,00.
+
+PERGUNTA: Quantos clientes temos em 2024?
+RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
+```
+
+## Se algo falhar
+
+**Toda pergunta cai na frase de falta de informação.** A collection pode estar vazia. Rode `python src/ingest.py` e só depois abra o chat.
+
+**A mensagem de inicialização do chat aparece na hora.** Falta variável no `.env` ou o Postgres não está aceitando conexão em `localhost:5432`. O texto logo acima dessa mensagem indica qual dos dois aconteceu.
+
+**A ingestão quebra depois de trocar o modelo de embedding.** A coluna de vetor nasce com a dimensão do primeiro modelo. O `text-embedding-3-small` usa 1536. Para outro modelo, apague o volume e ingira de novo:
+
+```bash
+docker compose down -v
+docker compose up -d
+python src/ingest.py
+```
+
+**A porta 5432 já está ocupada.** Outro Postgres está no mesmo endereço. Pare esse serviço ou mude a porta publicada no `docker-compose.yml` e o host do `DATABASE_URL`.
+
+<details>
+<summary>Enunciado do desafio</summary>
+
+## Objetivo
+
+Entregar um software capaz de:
+
+- Ingestão: ler um PDF e salvar o conteúdo em PostgreSQL com a extensão pgVector.
+- Busca: responder perguntas no terminal usando apenas o conteúdo do PDF.
+
 ## Tecnologias obrigatórias
 
-- Linguagem: Python
-- Framework: LangChain
-- Banco de dados: PostgreSQL + pgVector
-- Execução do banco de dados: Docker & Docker Compose (docker-compose fornecido no repositório de exemplo)
-
-## Pacotes recomendados
-
-- Split: `from langchain_text_splitters import RecursiveCharacterTextSplitter`
-- Embeddings (OpenAI): `from langchain_openai import OpenAIEmbeddings`
-- Embeddings (Gemini): `from langchain_google_genai import GoogleGenerativeAIEmbeddings`
-- PDF: `from langchain_community.document_loaders import PyPDFLoader`
-- Ingestão: `from langchain_postgres import PGVector`
-- Busca: `similarity_search_with_score(query, k=10)`
-
-## OpenAI
-
-- Crie uma API Key da OpenAI.
-- Você vai precisar de um modelo de embeddings e de um modelo de LLM para responder. Consulte a documentação oficial da OpenAI para ver os modelos disponíveis.
-
-## Gemini
-
-- Crie uma API Key da Google.
-- Você vai precisar de um modelo de embeddings e de um modelo de LLM para responder. Consulte a documentação oficial do Google para ver os modelos disponíveis.
-
-Os limites de requisições gratuitas dos modelos podem mudar com frequência. Para informações atualizadas, consulte a documentação oficial do Google.
-
-## Escolha dos modelos
-
-Este desafio não fixa modelos. Nomes e versões mudam com frequência e alguns são descontinuados, então faz parte do desafio consultar a documentação oficial do provedor que você escolher, ver quais modelos estão disponíveis no momento e selecionar os que atendem ao objetivo. Para o volume deste desafio, os modelos mais leves e baratos de cada provedor são suficientes.
-
-Atenção: modelos de embedding diferentes geram vetores com dimensões diferentes. A tabela de vetores é criada na primeira ingestão, já com a dimensão do modelo que você escolheu. Se você trocar de modelo de embeddings depois disso, a ingestão passa a falhar por incompatibilidade de dimensão. Nesse caso é responsabilidade sua apagar a collection existente (ou o volume do banco) e refazer a ingestão do zero com o novo modelo.
+- Python
+- LangChain
+- PostgreSQL + pgVector
+- Docker e Docker Compose para o banco
 
 ## Requisitos
 
-### 1. Ingestão do PDF
+### Ingestão
 
-- O PDF deve ser dividido em chunks de 1000 caracteres com overlap de 150.
-- Cada chunk deve ser convertido em embedding.
-- Os vetores devem ser armazenados no banco de dados PostgreSQL com pgVector.
+- Dividir o PDF em trechos de 1000 caracteres com sobreposição de 150.
+- Converter cada trecho em embedding.
+- Guardar os vetores no PostgreSQL com pgVector.
 
-### 2. Consulta via CLI
+### Consulta
 
-Criar um script Python para simular um chat no terminal.
-
-Passos ao receber uma pergunta:
+Ao receber uma pergunta:
 
 - Vetorizar a pergunta.
-- Buscar os 10 resultados mais relevantes (k=10) no banco vetorial.
+- Buscar os 10 resultados mais próximos (`k=10`).
 - Montar o prompt e chamar a LLM.
 - Retornar a resposta ao usuário.
 
-Prompt a ser utilizado:
+Prompt:
 
 ```
 CONTEXTO:
@@ -105,51 +320,8 @@ PERGUNTA DO USUÁRIO:
 RESPONDA A "PERGUNTA DO USUÁRIO"
 ```
 
-## Estrutura obrigatória do projeto
-
-Faça um fork do repositório para utilizar a estrutura abaixo: https://github.com/devfullcycle/mba-ia-desafio-ingestao-busca
-
-```
-├── docker-compose.yml
-├── requirements.txt      # Dependências
-├── .env.example          # Template das variáveis de ambiente
-├── src/
-│   ├── ingest.py         # Script de ingestão do PDF
-│   ├── search.py         # Script de busca
-│   ├── chat.py           # CLI para interação com usuário
-├── document.pdf          # PDF para ingestão
-└── README.md             # Instruções de execução
-```
-
-## VirtualEnv para Python
-
-Crie e ative um ambiente virtual antes de instalar dependências:
-
-```
-python3 -m venv venv
-source venv/bin/activate
-```
-
-## Ordem de execução
-
-1. Subir o banco de dados:
-
-```
-docker compose up -d
-```
-
-2. Executar ingestão do PDF:
-
-```
-python src/ingest.py
-```
-
-3. Rodar o chat:
-
-```
-python src/chat.py
-```
-
 ## Entregável
 
-Repositório público no GitHub contendo todo o código-fonte e README com instruções claras de execução do projeto.
+Repositório público no GitHub com o código-fonte e um README que explique como executar o projeto.
+
+</details>
